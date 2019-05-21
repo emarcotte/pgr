@@ -197,12 +197,12 @@ fn build_trees(records: &ProcessMap) -> Vec<Process> {
 
 fn print_child(child: &Process, width: usize, indent: &str, turn: &str, indent_bar: &str, mut writer: &mut std::io::Write) -> std::io::Result<()> {
     let digits = (child.pid as f32).log10().floor() as usize;
-    let split_cmd = wrap_cmdline(&child.cmdline, width - digits - 1);
+    let split_cmd = wrap_cmdline(&child.cmdline, (width - digits) - 5);
     let has_children = !child.children.is_empty();
     if let Some((head, tail)) = split_cmd.split_first() {
         writeln!(&mut writer, "{}{} {} {}", indent, turn, child.pid, head)?;
         if !tail.is_empty() {
-            let wrap_indent = format!("   {}{:2$}", if has_children { "│" } else { " " }, "", digits);
+            let wrap_indent = format!("{}  {}{:3$}", indent_bar, if has_children { "│" } else { " " }, "", digits);
             for tokens in tail {
                 writeln!(&mut writer, "{}{}  {}", indent, wrap_indent, tokens)?;
             }
@@ -285,19 +285,20 @@ fn wrap_cmdline(line: &str, width: usize) -> Vec<String> {
         }
     }
 
-    result
+    result.into_iter().map(|e| e.trim().to_owned()).collect()
 }
 
 #[test]
 fn test_wrap_cmdline() {
-    assert_eq!(wrap_cmdline("hello", 2), vec!("hello "));
-    assert_eq!(wrap_cmdline("hello --world", 20), vec!("hello --world "));
-    assert_eq!(wrap_cmdline("hello --world", 7), vec!("hello ", "--world "));
-    assert_eq!(wrap_cmdline("hello --world-war", 6), vec!("hello ", "--world-war "));
-    assert_eq!(wrap_cmdline("hello --word z", 9), vec!("hello ", "--word z "));
+    assert_eq!(wrap_cmdline("hello", 2), vec!("hello"));
+    assert_eq!(wrap_cmdline("hello", 5), vec!("hello"));
+    assert_eq!(wrap_cmdline("hello --world", 20), vec!("hello --world"));
+    assert_eq!(wrap_cmdline("hello --world", 7), vec!("hello", "--world"));
+    assert_eq!(wrap_cmdline("hello --world-war", 6), vec!("hello", "--world-war"));
+    assert_eq!(wrap_cmdline("hello --word z", 9), vec!("hello", "--word z"));
     assert_eq!(
         wrap_cmdline("hello z --word z superdyduperdydo", 9),
-        vec!("hello z ", "--word z ", "superdyduperdydo ")
+        vec!("hello z", "--word z", "superdyduperdydo")
     );
 }
 
@@ -326,7 +327,7 @@ fn main() {
         });
     }
 
-    match print_trees(&matched, width - 3, &String::from(""), &mut std::io::stdout()) {
+    match print_trees(&matched, width - 4, &String::from(""), &mut std::io::stdout()) {
         Err(_) => {},
         Ok(()) => {},
     };
