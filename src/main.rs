@@ -1,9 +1,11 @@
-use getopts::{Matches, Options,};
+use getopts::{Fail, Options,};
 use std::collections::HashMap;
 use std::fs::{File, read_dir, DirEntry, };
 use std::io::{BufRead, BufReader, };
 use std::path::Path;
 use users::{get_current_uid};
+use unicode_width::UnicodeWidthStr;
+use terminal_size::{Width, terminal_size};
 
 type ProcessMap = HashMap<u32, ProcessRecord>;
 type ProcessParams = HashMap<String, Vec<String>>;
@@ -193,22 +195,35 @@ fn build_trees(records: &ProcessMap) -> Vec<Process> {
         .collect()
 }
 
-fn print_trees(trees: &[&Process], indent: &str, mut writer: &mut std::io::Write) -> std::io::Result<()> {
+fn print_child(child: &Process, width: usize, indent: &str, turn: &str, indent_bar: &str, mut writer: &mut std::io::Write) -> std::io::Result<()> {
+    let digits = (child.pid as f32).log10().floor() as usize;
+    let split_cmd = wrap_cmdline(&child.cmdline, width - digits - 1);
+    let has_children = !child.children.is_empty();
+    if let Some((head, tail)) = split_cmd.split_first() {
+        writeln!(&mut writer, "{}{} {} {}", indent, turn, child.pid, head)?;
+        if !tail.is_empty() {
+            let wrap_indent = format!("   {}{:2$}", if has_children { "│" } else { " " }, "", digits);
+            for tokens in tail {
+                writeln!(&mut writer, "{}{}  {}", indent, wrap_indent, tokens)?;
+            }
+        }
+    }
+
+    print_trees(
+        &child.children.iter().collect::<Vec<_>>(),
+        width - 3,
+        &format!("{}{}  ", indent, indent_bar),
+        writer,
+    )?;
+    Ok(())
+}
+
+fn print_trees(trees: &[&Process], width: usize, indent: &str, writer: &mut std::io::Write) -> std::io::Result<()> {
     if let Some((last, rest)) = trees.split_last() {
         for proc in rest {
-            writeln!(&mut writer, "{}├─ {} {}", indent, proc.pid, proc.cmdline)?;
-            print_trees(
-                &proc.children.iter().collect::<Vec<_>>(),
-                &format!("{}│  ", indent),
-                writer,
-            )?;
+            print_child(&proc, width, indent, "├─", "│" , writer)?;
         }
-        writeln!(&mut writer, "{}└─ {} {}", indent, last.pid, last.cmdline)?;
-        print_trees(
-            &last.children.iter().collect::<Vec<_>>(),
-            &format!("{}   ", indent),
-            writer,
-        )?;
+        print_child(&last, width, indent, "└─", " ", writer)?;
     }
     Ok(())
 }
@@ -220,33 +235,87 @@ struct RunOpts {
 }
 
 impl RunOpts {
-    fn new(command_args: &[String]) -> RunOpts {
+    fn new(command_args: &[String]) -> Result<RunOpts, Fail> {
         let mut opts = Options::new();
         opts.optflag("a", "", "show all uids");
 
-        let matches: Matches = match opts.parse(&command_args[1..]) {
-            Ok(m)  => m,
-            Err(f) => panic!(f.to_string()),
-        };
+        let matches = opts.parse(&command_args[1..])?;
 
-        RunOpts {
-            filter: match matches.free.get(0) {
-                Some(f) => Some(f.clone()),
-                None    => None,
-            },
-            uid_search: ! matches.opt_present("a"),
+        Ok(
+            RunOpts {
+                filter: match matches.free.get(0) {
+                    Some(f) => Some(f.clone()),
+                    None    => None,
+                },
+                uid_search: ! matches.opt_present("a"),
+            }
+        )
+    }
+}
+
+fn wrap_cmdline(line: &str, width: usize) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let tokens = line.split_whitespace();
+    let mut cur_line_used = 0;
+
+    for token in tokens {
+        let token_width = UnicodeWidthStr::width(token);
+        if cur_line_used + token_width < width {
+            if let Some(curr_line) = result.last_mut() {
+                curr_line.push_str(token);
+                curr_line.push_str(" ");
+                cur_line_used += token_width;
+            }
+            else {
+                result.push(String::new());
+                if let Some(curr_line) = result.last_mut() {
+                    curr_line.push_str(token);
+                    curr_line.push_str(" ");
+                    cur_line_used = token_width + 1;
+                }
+            }
+        }
+        else {
+            result.push(String::new());
+            if let Some(curr_line) = result.last_mut() {
+                curr_line.push_str(token);
+                curr_line.push_str(" ");
+                cur_line_used = token_width + 1;
+            }
         }
     }
+
+    result
+}
+
+#[test]
+fn test_wrap_cmdline() {
+    assert_eq!(wrap_cmdline("hello", 2), vec!("hello "));
+    assert_eq!(wrap_cmdline("hello --world", 20), vec!("hello --world "));
+    assert_eq!(wrap_cmdline("hello --world", 7), vec!("hello ", "--world "));
+    assert_eq!(wrap_cmdline("hello --world-war", 6), vec!("hello ", "--world-war "));
+    assert_eq!(wrap_cmdline("hello --word z", 9), vec!("hello ", "--word z "));
+    assert_eq!(
+        wrap_cmdline("hello z --word z superdyduperdydo", 9),
+        vec!("hello z ", "--word z ", "superdyduperdydo ")
+    );
 }
 
 fn main() {
     let args = std::env::args().collect::<Vec<String>>();
-    let opts = RunOpts::new(&args);
-    let uid = get_current_uid();
+    let opts = RunOpts::new(&args).expect("Couldn't parse command line flags");
 
     let pids = visit_pids(Path::new("/proc")).expect("Couldn't read /proc");
     let trees = build_trees(&pids);
+
     let mut matched = vec!();
+
+    let uid = get_current_uid();
+
+    let width = match terminal_size() {
+        Some((Width(w), _)) => w as usize,
+        None => 80usize,
+    };
 
     for tree in &trees {
         tree.search(&mut matched, &|p| {
@@ -257,7 +326,7 @@ fn main() {
         });
     }
 
-    match print_trees(&matched, &String::from(""), &mut std::io::stdout()) {
+    match print_trees(&matched, width - 3, &String::from(""), &mut std::io::stdout()) {
         Err(_) => {},
         Ok(()) => {},
     };
