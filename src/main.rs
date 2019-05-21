@@ -1,9 +1,9 @@
+use getopts::{Matches, Options,};
+use std::collections::HashMap;
 use std::fs::{File, read_dir, DirEntry, };
 use std::io::{BufRead, BufReader, };
 use std::path::Path;
-use std::collections::HashMap;
 use users::{get_current_uid};
-
 
 type ProcessMap = HashMap<u32, ProcessRecord>;
 type ProcessParams = HashMap<String, Vec<String>>;
@@ -67,17 +67,30 @@ impl Process {
         proc
     }
 
-    fn search_tree<'a>(self: &'a Process, matcher: &Fn(&Process) -> bool, result: &mut Vec<&'a Process>) {
-    if matcher(self) {
-        result.push(self);
-    }
-    else {
-        for child in &self.children {
-            child.search_tree(matcher, result);
+    fn search<'a>(self: &'a Process, result: &mut Vec<&'a Process>, matcher: &Fn(&Process) -> bool) {
+        if matcher(self) {
+            result.push(self);
+        }
+        else {
+            for child in &self.children {
+                child.search(result, matcher);
+            }
         }
     }
 }
 
+fn get_string_param(params: &ProcessParams, param: &str) -> Result<String, PidReadError> {
+    match params.get(param) {
+        Some(p) => Ok(p[0].clone()),
+        None    => Err(PidReadError::ParseError(format!("missing {} parameter", param))),
+    }
+}
+
+fn get_u32_param(params: &ProcessParams, param: &str) -> Result<u32, PidReadError> {
+    match params.get(param) {
+        Some(p) => Ok(p[0].parse::<u32>()?),
+        None    => Err(PidReadError::ParseError(format!("missing {} parameter", param))),
+    }
 }
 
 fn get_pid_info(pid_dir: &Path) -> Result<ProcessRecord, PidReadError>  {
@@ -86,7 +99,17 @@ fn get_pid_info(pid_dir: &Path) -> Result<ProcessRecord, PidReadError>  {
     let pid = get_u32_param(&params, "Pid:")?;
     let ppid = get_u32_param(&params, "PPid:")?;
     let uid = get_u32_param(&params, "Uid:")?;
-    let cmdline = parse_cmdline(&pid_dir)?;
+    let status = get_string_param(&params, "State:")?;
+    let mut cmdline = parse_cmdline(&pid_dir)?;
+
+    if cmdline.is_empty() {
+        cmdline = get_string_param(&params, "Name:")?;
+        cmdline = format!("[{}]", cmdline);
+    }
+
+    if status.starts_with('Z') {
+        cmdline = format!("[{}] zombie!", cmdline);
+    }
 
     Ok(ProcessRecord { pid, ppid, uid, cmdline, })
 }
@@ -129,13 +152,6 @@ fn parse_cmdline(pid_dir: &Path) -> Result<String, PidReadError> {
     )
 }
 
-fn get_u32_param(params: &ProcessParams, param: &str) -> Result<u32, PidReadError> {
-    match params.get(param) {
-        Some(p) => Ok(p[0].parse::<u32>()?),
-        None    => Err(PidReadError::ParseError(format!("missing {} parameter", param))),
-    }
-}
-
 fn visit_pids(dir: &Path) -> Result<ProcessMap, PidReadError> {
     let mut pids = HashMap::new();
 
@@ -156,7 +172,7 @@ fn visit_pids(dir: &Path) -> Result<ProcessMap, PidReadError> {
     Ok(pids)
 }
 
-fn build_tree(records: &ProcessMap) -> Option<Process> {
+fn build_trees(records: &ProcessMap) -> Vec<Process> {
     let mut tree = HashMap::<u32, Vec<&ProcessRecord>>::new();
 
     for record in records.values() {
@@ -165,10 +181,16 @@ fn build_tree(records: &ProcessMap) -> Option<Process> {
             .push(record);
     }
 
-    match records.get(&1) {
-        Some(root) => Some(Process::new(root, &tree)),
-        None       => None,
-    }
+    records.values()
+        .filter_map(|rec| {
+            if rec.ppid == 0 {
+                Some(Process::new(rec, &tree))
+            }
+            else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn print_trees(trees: &[&Process], indent: &str, mut writer: &mut std::io::Write) -> std::io::Result<()> {
@@ -191,19 +213,52 @@ fn print_trees(trees: &[&Process], indent: &str, mut writer: &mut std::io::Write
     Ok(())
 }
 
-fn main() {
-    let pids = visit_pids(Path::new("/proc")).expect("Couldn't read /proc");
-    match build_tree(&pids) {
-        Some(root) => {
-            let uid = get_current_uid();
-            let mut matched = vec!();
-            root.search_tree(&|p: &Process| { p.uid == uid }, &mut matched);
+#[derive(Debug)]
+struct RunOpts {
+    filter: Option<String>,
+    uid_search: bool,
+}
 
-            match print_trees(&matched, &String::from(""), &mut std::io::stdout()) {
-                Err(_) => {},
-                Ok(()) => {},
-            };
-        },
-        None => println!("Couldn't find the root process..."),
+impl RunOpts {
+    fn new(command_args: &[String]) -> RunOpts {
+        let mut opts = Options::new();
+        opts.optflag("a", "", "show all uids");
+
+        let matches: Matches = match opts.parse(&command_args[1..]) {
+            Ok(m)  => m,
+            Err(f) => panic!(f.to_string()),
+        };
+
+        RunOpts {
+            filter: match matches.free.get(0) {
+                Some(f) => Some(f.clone()),
+                None    => None,
+            },
+            uid_search: ! matches.opt_present("a"),
+        }
+    }
+}
+
+fn main() {
+    let args = std::env::args().collect::<Vec<String>>();
+    let opts = RunOpts::new(&args);
+    let uid = get_current_uid();
+
+    let pids = visit_pids(Path::new("/proc")).expect("Couldn't read /proc");
+    let trees = build_trees(&pids);
+    let mut matched = vec!();
+
+    for tree in &trees {
+        tree.search(&mut matched, &|p| {
+            (!opts.uid_search || (p.uid == uid)) && match &opts.filter {
+                Some(f) => p.cmdline.contains(f),
+                None    => true,
+            }
+        });
+    }
+
+    match print_trees(&matched, &String::from(""), &mut std::io::stdout()) {
+        Err(_) => {},
+        Ok(()) => {},
     };
 }
