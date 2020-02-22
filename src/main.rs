@@ -23,6 +23,7 @@ use std::{
 use users::{get_current_uid};
 use unicode_width::UnicodeWidthStr;
 use terminal_size::{Width, terminal_size};
+use regex::Regex;
 
 type ProcessMap = HashMap<u32, ProcessRecord>;
 type ProcessParams = HashMap<String, Vec<String>>;
@@ -224,7 +225,7 @@ fn print_trees(trees: &[&Process], width: usize, indent: &str, writer: &mut dyn 
 
 #[derive(Debug)]
 struct RunOpts {
-    filter: Option<String>,
+    filter: Option<Regex>,
     uid_search: bool,
 }
 
@@ -238,7 +239,7 @@ impl RunOpts {
         Ok(
             RunOpts {
                 filter: match matches.free.get(0) {
-                    Some(f) => Some(f.clone()),
+                    Some(f) => Some(Regex::new(f).unwrap()),
                     None    => None,
                 },
                 uid_search: ! matches.opt_present("a"),
@@ -315,7 +316,7 @@ fn main() {
     for tree in &trees {
         tree.search(&mut matched, &|p| {
             (!opts.uid_search || (p.uid == uid)) && match &opts.filter {
-                Some(f) => p.cmdline.contains(f),
+                Some(f) => f.is_match(&p.cmdline),
                 None    => true,
             }
         });
