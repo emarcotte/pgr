@@ -1,8 +1,25 @@
 use getopts::{Fail, Options,};
-use std::collections::HashMap;
-use std::fs::{File, read_dir, DirEntry, };
-use std::io::{BufRead, BufReader, };
-use std::path::Path;
+use std::{
+    collections::{
+        HashMap,
+    },
+    error::{
+        Error,
+    },
+    fs::{
+        File,
+        read_dir,
+        DirEntry,
+    },
+    io::{
+        BufRead,
+        BufReader,
+        Write,
+    },
+    path::{
+        Path,
+    },
+};
 use users::{get_current_uid};
 use unicode_width::UnicodeWidthStr;
 use terminal_size::{Width, terminal_size};
@@ -16,29 +33,6 @@ struct ProcessRecord {
     uid: u32,
     ppid: u32,
     cmdline: String,
-}
-
-#[derive(Debug)]
-enum PidReadError {
-    ParseError(String),
-    IOError(std::io::Error),
-}
-
-impl From<std::num::ParseIntError> for PidReadError {
-    fn from(err: std::num::ParseIntError) -> PidReadError {
-        PidReadError::ParseError(format!("{}", err))
-    }
-}
-impl From<&str> for PidReadError {
-    fn from(err: &str) -> PidReadError {
-        PidReadError::ParseError(String::from(err))
-    }
-}
-
-impl From<std::io::Error> for PidReadError {
-    fn from(err: std::io::Error) -> PidReadError {
-        PidReadError::IOError(err)
-    }
 }
 
 #[derive(Debug)]
@@ -69,7 +63,7 @@ impl Process {
         proc
     }
 
-    fn search<'a>(self: &'a Process, result: &mut Vec<&'a Process>, matcher: &Fn(&Process) -> bool) {
+    fn search<'a>(self: &'a Process, result: &mut Vec<&'a Process>, matcher: &dyn Fn(&Process) -> bool) {
         if matcher(self) {
             result.push(self);
         }
@@ -81,21 +75,21 @@ impl Process {
     }
 }
 
-fn get_string_param(params: &ProcessParams, param: &str) -> Result<String, PidReadError> {
+fn get_string_param(params: &ProcessParams, param: &str) -> Result<String, Box<dyn Error>> {
     match params.get(param) {
         Some(p) => Ok(p[0].clone()),
-        None    => Err(PidReadError::ParseError(format!("missing {} parameter", param))),
+        None    => Err(format!("missing {} parameter", param).into()),
     }
 }
 
-fn get_u32_param(params: &ProcessParams, param: &str) -> Result<u32, PidReadError> {
+fn get_u32_param(params: &ProcessParams, param: &str) -> Result<u32, Box<dyn Error>> {
     match params.get(param) {
         Some(p) => Ok(p[0].parse::<u32>()?),
-        None    => Err(PidReadError::ParseError(format!("missing {} parameter", param))),
+        None    => Err(format!("missing {} parameter", param).into()),
     }
 }
 
-fn get_pid_info(pid_dir: &Path) -> Result<ProcessRecord, PidReadError>  {
+fn get_pid_info(pid_dir: &Path) -> Result<ProcessRecord, Box<dyn Error>>  {
     let params = read_pid_file(&pid_dir)?;
 
     let pid = get_u32_param(&params, "Pid:")?;
@@ -116,7 +110,7 @@ fn get_pid_info(pid_dir: &Path) -> Result<ProcessRecord, PidReadError>  {
     Ok(ProcessRecord { pid, ppid, uid, cmdline, })
 }
 
-fn read_pid_file(pid_dir: &Path) -> std::io::Result<ProcessParams> {
+fn read_pid_file(pid_dir: &Path) -> Result<ProcessParams, Box<dyn Error>> {
     let status_file = pid_dir.join("status");
     let handle = File::open(status_file.as_path())?;
     let reader = BufReader::new(handle);
@@ -125,14 +119,14 @@ fn read_pid_file(pid_dir: &Path) -> std::io::Result<ProcessParams> {
         let line = line?;
         let v: Vec<_> = line.split('\t').collect();
         let (head, tail) = v.split_at(1);
-        let tail: Vec<_> = tail.iter().map(|e| e.to_string()).collect();
+        let tail: Vec<_> = tail.iter().map(|e| (*e).to_string()).collect();
         let head = head[0];
         params.insert(String::from(head), tail);
     }
     Ok(params)
 }
 
-fn parse_cmdline(pid_dir: &Path) -> Result<String, PidReadError> {
+fn parse_cmdline(pid_dir: &Path) -> Result<String, Box<dyn Error>> {
     let status_file = pid_dir.join("cmdline");
     let handle = File::open(status_file.as_path())?;
     let mut reader = BufReader::new(handle);
@@ -154,7 +148,7 @@ fn parse_cmdline(pid_dir: &Path) -> Result<String, PidReadError> {
     )
 }
 
-fn visit_pids(dir: &Path) -> Result<ProcessMap, PidReadError> {
+fn visit_pids(dir: &Path) -> Result<ProcessMap, Box<dyn Error>> {
     let mut pids = HashMap::new();
 
     for entry in read_dir(dir)? {
@@ -195,7 +189,7 @@ fn build_trees(records: &ProcessMap) -> Vec<Process> {
         .collect()
 }
 
-fn print_child(child: &Process, width: usize, indent: &str, turn: &str, indent_bar: &str, mut writer: &mut std::io::Write) -> std::io::Result<()> {
+fn print_child(child: &Process, width: usize, indent: &str, turn: &str, indent_bar: &str, mut writer: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     let digits = (child.pid as f32).log10().floor() as usize;
     let split_cmd = wrap_cmdline(&child.cmdline, (width - digits) - 5);
     let has_children = !child.children.is_empty();
@@ -218,7 +212,7 @@ fn print_child(child: &Process, width: usize, indent: &str, turn: &str, indent_b
     Ok(())
 }
 
-fn print_trees(trees: &[&Process], width: usize, indent: &str, writer: &mut std::io::Write) -> std::io::Result<()> {
+fn print_trees(trees: &[&Process], width: usize, indent: &str, writer: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     if let Some((last, rest)) = trees.split_last() {
         for proc in rest {
             print_child(&proc, width, indent, "├─", "│" , writer)?;
